@@ -1,0 +1,6 @@
+numpy
+onnxruntime
+tokenizers
+faiss-cpu
+rank_bm25
+jieba
