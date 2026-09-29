@@ -6,7 +6,12 @@ rank_bm25
 jieba
 
 # 第四层「推理框架对照」才需要；不跑 bench_frameworks.py 可以不装。
-# ⚠️ Intel Mac 必须锁 2025.4.1 —— OpenVINO 从 2026.1 起不再发布 macOS x86_64 的 wheel
-#    （只发 arm64）。Linux / Windows 无此限制，可以装最新版。
+# ⚠️ Intel Mac 上是个版本死结，两个都要锁：
+#    · openvino 从 2026.1 起不再发布 macOS x86_64 的 wheel（只剩 arm64）→ 停在 2025.4.1
+#    · nncf 3.x 需要 openvino 的新 2-bit 类型（ov.Type.u2），在 2025.4.1 上 import 就报错
+#      → 配同一条发布线的 2.19.0
+#    Linux / Windows 没有这个约束，两个都可以用最新版。
 openvino==2025.4.1; sys_platform == "darwin" and platform_machine == "x86_64"
+nncf==2.19.0; sys_platform == "darwin" and platform_machine == "x86_64"
 openvino; sys_platform != "darwin" or platform_machine != "x86_64"
+nncf; sys_platform != "darwin" or platform_machine != "x86_64"

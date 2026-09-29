@@ -52,34 +52,70 @@
 前三层问的都是「**方案**选得对不对」（怎么切块、要不要重排、向量还是关键词）。
 这一层换一个问法：**模型不动、数据不动，只换推理框架，会怎样。**
 
-换框架在工程上常被默认成「免费的提速」。实测不是。同一个 int8 量化的 bge-small-zh-v1.5，
-ONNX Runtime 与 **OpenVINO 2025.4.1**（CPU，本机 Intel Mac）对照：
+换框架在工程上常被默认成「免费的提速」。实测不是。——**而且第一版结论是错的。**
 
-| | ONNX Runtime | OpenVINO 默认 | OpenVINO `LATENCY` | OpenVINO `THROUGHPUT` |
+### 四种组合
+
+关键在最后两行：**光比前两行等于让 OpenVINO 跑别人压出来的 int8，是不公平的。**
+所以又用 OpenVINO 自家的量化工具链（**NNCF**）从 **FP32** 重新量化了一遍。
+
+| 标签 | 模型来源 | 量化工具链 |
+|---|---|---|
+| `ONNX Runtime int8` | `model_quantized.onnx` | **onnxruntime** 自家 quantizer |
+| `OV + onnxrt int8` | 同一文件转 IR | onnxruntime（OpenVINO 只是照跑） |
+| `OV + NNCF int8` | 从 **FP32** 重量化 | **NNCF**（OpenVINO 自家，用本仓库语料校准） |
+| `OV + FP32` | FP32 原始模型 | 不量化（精度上限参照） |
+
+### 实测（Intel Mac / CPU-only / openvino 2025.4.1 + nncf 2.19.0）
+
+**精度**——与 **FP32 真模型**的接近程度（越大越准，这是不偏袒任何一方的量法）：
+
+| | 最小余弦 | 文档 | 查询 |
+|---|---|---|---|
+| ONNX Runtime int8 | 0.985980 | 0.987149 | 0.985980 |
+| OV + onnxrt int8 | 0.986101 | 0.987068 | 0.986101 |
+| **OV + NNCF int8** | **0.987142** | **0.990208** | **0.987142** |
+
+**延迟**（16 个文档块，batch=16，轮转交错取中位 / 最快，ms/块）：
+
+| 配置 | 中位 | 最快 | 相对 ONNX |
+|---|---|---|---|
+| **ONNX Runtime int8** | **7.03** | **6.04** | — |
+| OV + onnxrt int8 | 14.53 | 13.43 | 2.07× |
+| OV + NNCF int8 默认 | **11.70** | 9.61 | **1.66×** |
+| OV + NNCF int8 `LATENCY` | 11.65 | 9.60 | 1.66× |
+| OV + NNCF int8 `THROUGHPUT` | 18.42 | 15.76 | 2.62× |
+
+**端到端**（同一套检索评测，只换 embedder）：
+
+| | R@1 | R@3 | MRR | 排名变化 |
 |---|---|---|---|---|
-| 向量化 16 个文档块（中位） | **108 ms** | 251 ms | 221 ms | 264 ms |
-| 每块 | **6.8 ms** | 15.7 ms | 13.8 ms | 16.5 ms |
-| 相对 ONNX | — | 2.32× | **2.04×** | 2.44× |
+| ONNX Runtime int8 | 94% | 100% | 0.972 | 基准 |
+| OV + onnxrt int8 | **89%** | 100% | **0.944** | 1 / 18 |
+| **OV + NNCF int8** | **94%** | 100% | **0.972** | **0 / 18** |
+| OV + FP32 | 94% | 100% | 0.972 | 0 / 18 |
 
-**数值**：两边输出最小余弦 **0.993**、`max|diff|` 1.9e-2（同一份 int8 权重，kernel 不同）。
+### ⭐ 结论：一开始那个「OpenVINO 慢 2 倍、检索还掉 5 个点」，有一半不是框架的锅
 
-**端到端**：同一套检索评测只换 embedder —— ONNX Runtime `R@1 94% / MRR 0.972`，
-OpenVINO `R@1 89% / MRR 0.944`。**向量只差 0.7%，R@1 掉了 5 个点。**
+先做前两行时，结论看着很清楚：**慢 2.07×，而且 `R@1` 从 94% 掉到 89%。**
+但补上 NNCF 那一行之后，画面变了：
+
+- **延迟**：2.07× → **1.66×**（比跑外来的 int8 快 **24%**）
+- **精度**：0.9861 → **0.9871**，**比 onnxruntime 那版更接近 FP32**
+- **端到端**：`R@1` 从 89% **回到 94%**，MRR 复原，**逐条排名 0/18 变化**
+
+**同一份权重、同一个 CPU，只把「谁来量化」换掉，三件事一起变好。**
+所以那个差距里，**有相当一部分来自量化工具链的适配，而不是框架本身**。
+这个变量如果不控制住，就会得出「OpenVINO 不行」的错误结论——**而它只是没被喂对东西。**
 
 ### 四个能拿去讲的点
 
-1. **动态形状是要付钱的。** 这个 ONNX 的输入是全动态 `[?, ?]`，而 OpenVINO 的 CPU 插件在动态维度上
-   对 int8 量化节点做 shape 推断会直接报错（`PowerStatic` / `Eltwise shape infer mismatch`），
-   必须 **reshape 成固定形状再编译**。后果是**每遇到一个新的 (batch, seq) 组合就要重新
-   read + reshape + compile**（本机冷启动 882 ms，共 3 次重编译）。ONNX Runtime 的动态形状是原生的，
-   不需要付这笔钱。**换框架的账要从这里开始算，不是从稳态吞吐开始算。**
+1. **⭐ 第一版结论是错的，是补了对照组才发现的。** 只比「ONNX Runtime vs OpenVINO（跑别人的 int8）」
+   会得出「OpenVINO 慢一倍、检索还掉点」。补上 NNCF 从 FP32 重量化那一行之后，
+   才知道**差距的一大半来自量化产物不匹配**，不是框架。**做框架对比，量化工具链是必须先控制的变量。**
 
-2. **性能开关不是越多越好。** `THROUGHPUT` 模式在这个场景下**比默认还慢**（16.5 vs 15.7 ms/块）——
-   它会把 stream 开起来，而 16 个块的小负载根本喂不饱，调度开销反而变成主要成本。
-   `LATENCY` 才是这里该用的（13.8 ms/块，比默认快 12%）。**默认配置不等于上限，但也不等于下限。**
-
-3. **⭐ 向量几乎一致，检索指标却掉了。** 这条最值得讲。两边向量最小余弦 0.993，
-   看着"一样"，但 `R@1` 从 94% 掉到 89%。逐条查下来只有 1 条 query 翻了排名：
+2. **向量几乎一致，检索指标却会掉。** 两边向量最小余弦 0.993，看着"一样"，
+   但 `R@1` 从 94% 掉到 89%。逐条查下来只有 1 条 query 翻排名：
 
    ```
    「临时有事来不及走流程怎么办」
@@ -91,13 +127,32 @@ OpenVINO `R@1 89% / MRR 0.944`。**向量只差 0.7%，R@1 掉了 5 个点。**
    在近乎打平的排序上，任何微小的数值差异都会翻名次。
    **所以「向量相似度 0.99 所以结果一样」这个推论是错的**，必须拿端到端指标说话。
 
-4. **但这是个对 OpenVINO 不公平的对比，得说清楚。**
-   - 那个 ONNX 模型**本来就是 onnxruntime 自家 quantizer 压出来的 int8**，
-     OpenVINO 只是照跑别人的量化产物，**没用上自己的量化工具链（NNCF）和 kernel**；
-   - 本机是**老 Intel CPU，没有 VNNI / AMX**，而 OpenVINO 的优势恰好吃这些指令集；
-   - 模型太小（23MB），延迟在毫秒级，框架调度开销的占比被放大。
+3. **动态形状是要付钱的。** 这个 ONNX 的输入是全动态 `[?, ?]`，而 OpenVINO 的 CPU 插件在动态维度上
+   对 int8 量化节点做 shape 推断会直接报错（`PowerStatic` / `Eltwise shape infer mismatch`），
+   必须 **reshape 成固定形状再编译**。后果是**每遇到一个新的 (batch, seq) 组合就要重新
+   read + reshape + compile**（本机冷启动 1.2 s）。ONNX Runtime 的动态形状是原生的，不付这笔钱。
 
-   **正确的说法不是「OpenVINO 不行」，而是「它在什么条件下才赢，我这个场景赢不了」。**
+4. **性能开关不是越多越好。** `THROUGHPUT` 在这个场景下**比默认还慢**（18.4 vs 11.7 ms/块）——
+   它把 stream 开起来，而 16 个块的小负载喂不饱，调度开销反成主要成本。
+   **默认配置不等于上限，但也不等于下限。**
+
+### ⚠️ 两条测量上的坑（都实际踩过）
+
+- **不能一档测完再测下一档。** 这台机器平时就跑着 VM（`com.apple.Virtualization.VirtualMachine`
+  实测吃到 500% CPU，load average 11+）。顺序测时瞬时尖峰只会砸在正在跑的那一档上——
+  **量出过 40.5 ms/块，而同一模型单独测只有 9.7，差 4 倍全是假象。**
+  现在改成**轮转交错**：每轮把所有档各测一次，干扰均摊，并同时输出**最快值**
+  （最不受干扰的一次，比中位更适合估计真实性能）。
+- **校准集只有 34 条**（知识库正文 + 评测 query），比 NNCF 文档建议的 100~300 条少。
+  语料就这么大，与其灌不相关的文本，不如用真实分布。**这是取舍，不是疏忽。**
+
+### 顺带：Intel Mac 上的版本死结
+
+- `openvino` 从 **2026.1 起不再发布 macOS x86_64 的 wheel** → 本机只能停在 **2025.4.1**
+- 而 `nncf` 3.x 需要 OpenVINO 的新 2-bit 类型（`ov.Type.u2`），在 2025.4.1 上
+  **import 就报 `AttributeError: ... has no attribute 'u2'`**
+- 解法：装**与 OpenVINO 2025.4.x 同一条发布线**的 **NNCF 2.19.0**（2025-12-01 发布）
+- **Linux / Windows 没这个约束**，可以直接用最新的 OpenVINO + NNCF
 
 ## 为什么用 ONNX 而不是 sentence-transformers
 
@@ -113,15 +168,17 @@ python run_eval.py           # 跑分块 × 检索的对照实验
 python ask.py "出差住宿能报多少"
 
 # 第四层（推理框架对照）
-python convert_to_openvino.py   # ONNX → OpenVINO IR
-python bench_frameworks.py      # ONNX Runtime vs OpenVINO：数值 / 延迟 / 端到端
+python convert_to_openvino.py   # ONNX(int8) → OpenVINO IR
+python quantize_nncf.py         # FP32 → NNCF int8（公平对比的关键一步）
+python bench_frameworks.py      # 四路对照：精度 / 延迟 / 端到端
 ```
 
 `run_eval.py` 会把每次结果写到 `results/eval-*.json`，包含没召回的 query。
-`bench_frameworks.py` 写到 `results/framework-*.json`，包含延迟与**排名发生变化的 query**。
+`bench_frameworks.py` 写到 `results/framework-*.json`，包含延迟、精度与**排名发生变化的 query**。
 
-⚠️ **Intel Mac 装 OpenVINO 要锁版本**：`openvino` 从 2026.1 起只发 macOS arm64 的 wheel，
-x86_64 停在 **2025.4.1**。Linux / Windows 不受影响，可以装最新版。
+⚠️ **Intel Mac 装 OpenVINO/NNCF 要锁版本**：`openvino` 从 2026.1 起只发 macOS arm64 的 wheel，
+x86_64 停在 **2025.4.1**；而 `nncf` 3.x 在 2025.4.1 上 import 就会报错，要配 **2.19.0**。
+Linux / Windows 不受影响，可以装最新版。
 
 ## 目录
 
@@ -134,7 +191,8 @@ raglab/
   retrieve.py          四种检索：vector / bm25 / hybrid(RRF) / hybrid+cross-encoder 重排
   evaluate.py          recall@k 与 MRR
 convert_to_openvino.py ONNX → OpenVINO IR（保留动态形状，由 embedder 按需 reshape）
-bench_frameworks.py    第四层：ONNX Runtime vs OpenVINO 的数值 / 延迟 / 端到端对照
+quantize_nncf.py       FP32 → NNCF int8（用本仓库语料校准）
+bench_frameworks.py    第四层：四路对照，含精度 / 延迟 / 端到端 / 逐条排名变动
 data/
   docs/         知识库：云雀商城客服 FAQ（9 篇）+ 差旅报销政策（7 篇）
   eval/         评测集：18 条 query，标注答案所在小节
@@ -165,7 +223,9 @@ data/
 - **向量库**：用的是 FAISS 本地索引，没用过 Qdrant / Milvus 这类服务化向量库
 - **重排的延迟优化**：600ms 是 CPU 上 int8 模型逐条打分的结果，没做过 batch、量化再压、或者换更小的模型
 - **生产规模**：16 篇文档，没在真实体量上验证过
-- **NNCF 原生量化**：第四层用的是 onnxruntime 压出来的 int8 ONNX，OpenVINO 只是照跑。
-  **没用 NNCF 在 OpenVINO 里重新量化过**，所以那个"慢 2 倍"的结果对 OpenVINO 不公平，不能当定论
-- **bfloat16 / 动态量化**：没试过，也没试过更大模型——OpenVINO 的优势场景（大模型、带 VNNI/AMX 的
-  新 Intel CPU、视觉与 LLM）一个都没覆盖到，本机是 CPU-only 的老 Intel Mac
+- **bfloat16 / 更大模型**：没试过。OpenVINO 最擅长的场景——视觉、LLM、带 VNNI/AMX 的新 Intel CPU——
+  一个都没覆盖到，本机是 CPU-only 的老 Intel Mac。**所以这里所有延迟数字都不能外推。**
+- **校准集偏小**：NNCF 只用了 34 条（知识库正文 + 评测 query），比官方建议的 100~300 条少
+- **量化敏感度分析**：没做逐层敏感度对比，也没试过混合精度（只量化一部分层）
+- **多次重复的统计检验**：延迟只跑了中位/最快值，没做置信区间；18 条 query 的 R@1 差异
+  在统计上也说明不了太多（一条 query 就是 5.6 个点）
